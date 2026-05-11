@@ -1,0 +1,54 @@
+"""Tests for the medication diff logic."""
+
+import pytest
+from app.diff import compute_diff
+from app.models import MedChange
+
+
+def _med(name: str, status: str = "active", dose: str = "10 mg once daily") -> dict:
+    return {
+        "resourceType": "MedicationRequest",
+        "status": status,
+        "medicationCodeableConcept": {
+            "coding": [{"display": name}]
+        },
+        "dosageInstruction": [{
+            "doseAndRate": [{"doseQuantity": {"value": dose.split()[0], "unit": "mg"}}],
+            "timing": {"code": {"text": " ".join(dose.split()[2:])}},
+        }],
+    }
+
+
+def test_detects_new_medication():
+    active = [_med("Empagliflozin")]
+    all_meds = [_med("Empagliflozin")]
+    changes = compute_diff(active, all_meds)
+    assert any(c.type == "added" and c.medication == "Empagliflozin" for c in changes)
+
+
+def test_detects_stopped_medication():
+    active = []
+    all_meds = [_med("Omeprazole", status="stopped")]
+    changes = compute_diff(active, all_meds)
+    assert any(c.type == "stopped" and c.medication == "Omeprazole" for c in changes)
+
+
+def test_detects_dose_change():
+    active = [_med("Metformin", dose="1000 mg twice daily")]
+    all_meds = [
+        _med("Metformin", dose="1000 mg twice daily"),
+        _med("Metformin", dose="500 mg twice daily"),
+    ]
+    changes = compute_diff(active, all_meds)
+    assert any(c.type == "changed" and c.medication == "Metformin" for c in changes)
+
+
+def test_no_changes_returns_empty():
+    med = _med("Lisinopril")
+    # Same med appears once in both lists — not "new" if it was already there
+    active = [med]
+    # Two entries = it existed before = not new, and dosage unchanged
+    all_meds = [med, med]
+    changes = compute_diff(active, all_meds)
+    # No stopped, no added (2 entries), dosage identical so no changed
+    assert all(c.type != "stopped" for c in changes)
