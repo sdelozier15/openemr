@@ -1,6 +1,8 @@
 # med-reconciliation
 
-A lightweight Python microservice that detects medication changes in OpenEMR and surfaces a pre-filled reconciliation note — triggered only when a clinician clicks **Edit medications**, never on chart open.
+A lightweight Python microservice for event-triggered medication reconciliation using OpenEMR's FHIR R4 and native REST APIs.
+
+---
 
 ## How it works
 
@@ -8,29 +10,51 @@ A lightweight Python microservice that detects medication changes in OpenEMR and
 Clinician clicks "Edit medications"
         │
         ▼
-GET /reconcile/{patient_id}          ← your EHR calls this with the SMART Bearer token
+GET /baseline/{patient_id}                    ← fires silently on open
         │
-        ├─ GET /fhir/MedicationRequest?status=active
-        ├─ GET /fhir/MedicationRequest?status=active,stopped&_sort=-date
-        └─ diff computed in-process
-        │
-        ▼
-{ changes_detected: true/false, changes: [...], attestation_note: "..." }
-        │
-   if true → show reconciliation panel to clinician
-   if false → medications editor opens normally, nothing extra shown
+        └─ GET /fhir/MedicationRequest?status=active
+           Returns before-snapshot to frontend. Frontend holds it.
+           No UI change. Clinician sees nothing.
         │
         ▼
-Clinician edits note, clicks "Confirm & sign"
+Clinician works through med list normally
+(add, stop, change — via OpenEMR's own dialog boxes)
         │
         ▼
-POST /reconcile/{patient_id}/submit  ← fires two calls on confirmation
+Clinician clicks X to close the medication list
+(dlgopen onClosed callback fires)
         │
-        ├─ POST /fhir/DocumentReference               (attestation note → patient chart)
-        └─ PATCH /api/encounter/{encounter_id}/amc    (checks "Medication Reconciliation Performed?")
+        ▼
+POST /diff/{patient_id}  +  baseline snapshot in body
+        │
+        └─ GET /fhir/MedicationRequest?status=active,stopped,on-hold
+           Diff computed: baseline vs post-close state
+        │
+        ▼
+Panel ALWAYS appears — even if no changes found
+        │
+        ├─ Shows pre-filled attestation note (clinician edits if needed)
+        ├─ Shows patient-facing note preview
+        └─ "Confirm & sign" button
+        │
+        ▼
+Clinician clicks "Confirm & sign"
+        │
+        ▼
+POST /submit/{patient_id}
+        │
+        ├─ POST /api/patient/{id}/encounter/{id}/note
+        │       Attestation note → Visit Summary
+        │
+        ├─ POST /fhir/DocumentReference
+        │       Title: "Medication changes made today"
+        │       Linked to encounter → appears under Link/Add Issues to This Visit
+        │       Patient-facing language, visible in patient portal
+        │
+        └─ PATCH /api/encounter/{id}
+                "Medication Reconciliation Performed?" checkbox → checked
+                Always checked (Option B) — reviewing the list IS reconciliation
 ```
-
-No polling. No background jobs. One GET on a user action, one POST on explicit confirmation. The AMC checkbox is OpenEMR's own built-in encounter field — no custom flags or FHIR extensions needed.
 
 ---
 
@@ -44,80 +68,109 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# edit .env with your OpenEMR FHIR base URL
+# edit .env with your OpenEMR base URLs
 
 uvicorn app.main:app --reload
 ```
 
-API docs auto-generated at `http://localhost:8000/docs`.
+API docs at `http://localhost:8000/docs`.
 
 ---
 
 ## Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/reconcile/{patient_id}` | Fetch diff + draft note. Requires `Authorization: Bearer <token>`. |
-| `POST` | `/reconcile/{patient_id}/submit` | Write confirmed note to OpenEMR + check the AMC checkbox. |
-| `GET` | `/health` | Liveness check. |
+| Method | Path | Trigger | Description |
+|--------|------|---------|-------------|
+| `GET` | `/baseline/{patient_id}` | Med list **opens** | Captures before-snapshot. Silent. |
+| `POST` | `/diff/{patient_id}` | Med list **closes** | Runs second GET, diffs, returns both notes. |
+| `POST` | `/submit/{patient_id}` | Clinician confirms | Writes notes + checks AMC checkbox. |
+| `GET` | `/health` | — | Liveness check. |
 
-### Example request
+---
 
-```bash
-curl -H "Authorization: Bearer <your_smart_token>" \
-     http://localhost:8000/reconcile/00482917
-```
+## Frontend integration (SMART app JavaScript)
 
-### Example response (changes detected)
+```javascript
+const patientId = FHIR.context.patientId;
+const encounterId = FHIR.context.encounterId;
+const token = FHIR.context.accessToken;
+let baselineSnapshot = [];
 
-```json
-{
-  "patient_id": "00482917",
-  "changes_detected": true,
-  "changes": [
-    { "type": "stopped",  "medication": "Omeprazole",    "detail": "Status: stopped" },
-    { "type": "changed",  "medication": "Metformin",     "detail": "500 mg BID → 1000 mg BID" },
-    { "type": "added",    "medication": "Empagliflozin", "detail": "New: 10 mg once daily" }
-  ],
-  "attestation_note": "MEDICATION RECONCILIATION NOTE\nDate: ..."
+// ── TRIGGER 1: Med list opens ─────────────────────────────────────────────
+// Intercept the existing "Edit medications" button click.
+// Fire baseline GET silently. No UI change.
+
+document.querySelector('#edit-medications-btn').addEventListener('click', async () => {
+  const res = await fetch(
+    `/baseline/${patientId}?encounter_id=${encounterId}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const data = await res.json();
+  baselineSnapshot = data.snapshot;   // held in memory until close
+
+  // Open the existing OpenEMR medication dialog as normal
+  dlgopen('/interface/patient_file/medication_list.php', '_blank', 900, 600, '', '', {
+
+    // ── TRIGGER 2: Med list closes ─────────────────────────────────────────
+    // onClosed fires when clinician clicks X. Always fires.
+    onClosed: async () => {
+      const diffRes = await fetch(
+        `/diff/${patientId}?encounter_id=${encounterId}&clinician_name=${encodeURIComponent(clinicianName)}`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(baselineSnapshot),
+        }
+      );
+      const diff = await diffRes.json();
+
+      // Panel ALWAYS appears — even if diff.changes_detected is false
+      showReconciliationPanel(diff);
+    }
+  });
+});
+
+// ── SUBMIT: Clinician confirms ────────────────────────────────────────────
+async function handleConfirm(attestationNote, patientNote) {
+  await fetch(`/submit/${patientId}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      encounter_id: encounterId,
+      attestation_note: attestationNote,
+      patient_note: patientNote,
+    }),
+  });
 }
 ```
 
-### Example response (no changes)
+---
 
-```json
-{
-  "patient_id": "00482917",
-  "changes_detected": false,
-  "changes": [],
-  "attestation_note": null
-}
-```
+## What gets written on submit
 
-When `changes_detected` is `false`, your frontend should open the medications editor normally — no panel, no interruption.
+| Destination | Content | Where it appears |
+|-------------|---------|-----------------|
+| Native encounter note | Full attestation note, clinician-signed | Visit Summary |
+| FHIR DocumentReference | "Medication changes made today" — plain language | Link/Add Issues to This Visit · patient portal |
+| AMC checkbox | "Medication Reconciliation Performed?" | Encounter AMC Requires panel |
+
+The DocumentReference is linked to the encounter via `context.encounter`, which is what causes it to appear under **Link/Add Issues to This Visit** in the Visit Summary — this is the standard FHIR mechanism for attaching documents to a specific encounter.
 
 ---
 
 ## The AMC checkbox
 
-OpenEMR's encounter form includes a native **"Medication Reconciliation Performed?"** checkbox under the AMC Requires panel. This is the reconciliation flag — no custom FHIR extension or Task resource needed.
+OpenEMR's encounter form has a native "Medication Reconciliation Performed?" checkbox under AMC Requires. No custom flag needed — this is the field.
 
-When the clinician clicks "Confirm & sign", the `/submit` endpoint fires two calls in sequence:
+**Option B is implemented:** the checkbox is always checked on submit, regardless of whether changes were found. The clinician confirmed they reviewed the list — that act is the reconciliation.
 
-```python
-# 1. Write the attestation note to the patient chart
-POST /apis/default/fhir/DocumentReference
-
-# 2. Check the AMC checkbox on the current encounter
-PATCH /apis/default/api/encounter/{encounter_id}
-Body: { "pc_recurrtype": 1 }   # ← exact field TBD — see note below
-```
-
-> **Important:** The exact native API call for the AMC checkbox needs to be confirmed against your OpenEMR instance. The cleanest way to find it: open the encounter in the demo, check the box manually, and inspect the network tab in DevTools. OpenEMR's own UI will show you the exact endpoint and payload it uses. That's the call to replicate.
->
-> The checkbox lives in `form_encounter` or a related AMC table internally — not as a FHIR resource — so it's reached via the native REST API (`/apis/default/api/...`), not the FHIR base URL.
-
-Once checked, the checkbox persists on the encounter record. Re-running the diff on a future edit-medications click will return `changes_detected: false` if nothing new has changed, so the panel won't reappear.
+> **Important:** The exact PATCH field name must be confirmed against your instance. Open the encounter in the demo, check the box manually, and inspect the network tab in DevTools. That shows the exact endpoint and payload. Update `amc.py` accordingly.
 
 ---
 
@@ -125,17 +178,15 @@ Once checked, the checkbox persists on the encounter record. Re-running the diff
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENEMR_FHIR_BASE` | `https://localhost:9300/apis/default/fhir` | Base URL for your OpenEMR FHIR R4 endpoint |
+| `OPENEMR_FHIR_BASE` | `https://localhost:9300/apis/default/fhir` | FHIR R4 base URL |
+| `OPENEMR_NATIVE_BASE` | `https://localhost:9300/apis/default/api` | Native REST base URL |
 | `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated CORS origins |
 
 ---
 
-## OpenEMR setup
-
-This service expects an OpenEMR instance with the FHIR API enabled. The fastest path is Docker:
+## OpenEMR setup (Docker)
 
 ```yaml
-# docker-compose.yml
 services:
   openemr:
     image: openemr/openemr:latest
@@ -143,6 +194,7 @@ services:
       - 8300:80
       - 9300:443
     environment:
+      OPENEMR_SETTING_rest_api: 1
       OPENEMR_SETTING_rest_fhir_api: 1
       OPENEMR_SETTING_site_addr_oath: 'https://localhost:9300'
       OE_USER: admin
@@ -153,18 +205,17 @@ services:
       MYSQL_ROOT_PASSWORD: root
 ```
 
-Then register a SMART client and get a Bearer token — see [OpenEMR API README](https://github.com/openemr/openemr/blob/master/API_README.md).
-
-The service uses the token your EHR passes at SMART launch. It never stores credentials.
+Register a SMART client and get a Bearer token: [OpenEMR API README](https://github.com/openemr/openemr/blob/master/API_README.md).
 
 ---
 
 ## Running tests
 
 ```bash
-pip install pytest
 pytest tests/ -v
 ```
+
+11 tests covering: diff logic (added/stopped/changed/unchanged), both note builders (with and without changes), and the two-trigger flow contract.
 
 ---
 
@@ -172,30 +223,28 @@ pytest tests/ -v
 
 ```
 app/
-  main.py      # FastAPI app, route handlers
-  fhir.py      # FHIR R4 fetch helpers (MedicationRequest)
-  diff.py      # Detects added / stopped / changed medications
-  models.py    # Pydantic request/response models
-  note.py      # Builds the pre-filled attestation note text
+  main.py      # FastAPI routes: /baseline, /diff, /submit
+  fhir.py      # fetch_baseline() and fetch_post_close() — two separate GETs
+  diff.py      # Diffs baseline vs post-close snapshot
+  models.py    # Pydantic schemas for all request/response shapes
+  note.py      # build_attestation_note() and build_patient_note()
+  amc.py       # PATCH helper for the AMC checkbox
 tests/
-  test_diff.py # Unit tests for the diff logic
+  test_diff.py # 11 unit tests
 ```
 
 ---
 
 ## Key design decisions
 
-**Why trigger on the edit click, not on chart open?**
-A banner that fires on every chart open would interrupt clinicians constantly. The reconciliation prompt is only relevant when they're already thinking about medications — so that's the only moment it appears.
+**Why does the panel always appear even when no changes are found?**
+The clinician reviewed the list — that is the reconciliation, regardless of outcome. Always surfacing the panel means they always confirm, the AMC checkbox always gets checked, and the patient always receives a note ("No changes were made to your medications today"). This satisfies AMC reporting correctly and gives the patient useful communication either way.
 
-**Why a microservice and not a plugin?**
-Keeps the reconciliation logic independently deployable and testable. The EHR calls one endpoint; it doesn't need to know anything about the diff or note-building logic.
+**Why is the microservice stateless between the two triggers?**
+The frontend holds the baseline snapshot in memory between open and close. This means the service works correctly across restarts, multiple instances, and scaled deployments with no shared cache or database.
 
-**Why no database?**
-State lives in OpenEMR. This service is stateless — it reads from FHIR, computes a diff in-process, and writes back via FHIR. No extra persistence layer to manage.
+**Why two separate note destinations?**
+The attestation note (Visit Summary) is for the clinician's record — detailed, signed, clinical language. The patient note (Link/Add Issues to This Visit) is for the patient — plain language, brief, focused on what changed. These serve different audiences and different regulatory purposes.
 
-**Does the diff run against signed or unsigned medication changes?**
-The diff runs against whatever is currently written to OpenEMR's database — not the signed state. If your workflow commits medication changes on save (before signing), the diff picks them up immediately. If your workflow only commits on sign, the trigger point for the GET may need to shift to post-signing. Confirm this against your instance before deploying: check whether a draft/unsigned medication order is visible via `GET /fhir/MedicationRequest` before the encounter is signed.
-
-**Why use the native AMC checkbox instead of a custom flag?**
-OpenEMR already has a "Medication Reconciliation Performed?" checkbox built into every encounter's AMC Requires panel. Patching that field programmatically after confirmed reconciliation means no custom FHIR extensions, no separate tracking table, and the checkbox shows up exactly where clinical staff already expect to see it.
+**Why `dlgopen onClosed` and not a DOM observer?**
+OpenEMR's `dlgopen()` function has a native `onClosed` callback used throughout the codebase (see `encounters.php`, `facility_user.php`). This is the clean, supported hook — no fragile DOM mutation observers needed.
