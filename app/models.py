@@ -1,89 +1,40 @@
-"""
-Compute medication changes by diffing the active list against the full history.
-Detects: newly added, stopped, and dose/frequency changes.
-"""
+"""Pydantic models for request/response shapes."""
 
-from app.models import MedChange
+from pydantic import BaseModel
+from typing import Optional, Literal
 
 
-def _med_name(resource: dict) -> str:
-    """Extract a human-readable name from a MedicationRequest resource."""
-    med = resource.get("medicationCodeableConcept", {})
-    codings = med.get("coding", [])
-    if codings:
-        return codings[0].get("display", "Unknown")
-    return med.get("text", "Unknown")
+class MedChange(BaseModel):
+    type: Literal["added", "stopped", "changed"]
+    medication: str
+    detail: str
 
 
-def _dosage_summary(resource: dict) -> str:
-    """Flatten dosageInstruction into a short string for comparison."""
-    instructions = resource.get("dosageInstruction", [])
-    if not instructions:
-        return ""
-    parts = []
-    for d in instructions:
-        dose = d.get("doseAndRate", [{}])[0]
-        qty = dose.get("doseQuantity", {})
-        value = qty.get("value", "")
-        unit = qty.get("unit", "")
-        timing = d.get("timing", {}).get("code", {}).get("text", "")
-        parts.append(f"{value} {unit} {timing}".strip())
-    return "; ".join(parts)
+class BaselineResponse(BaseModel):
+    """Returned on GET /baseline — the before-snapshot captured when med list opens."""
+    patient_id: str
+    encounter_id: str
+    snapshot: list[dict]          # raw FHIR MedicationRequest resources, held by frontend
 
 
-def compute_diff(
-    active: list[dict],
-    all_meds: list[dict],
-) -> list[MedChange]:
-    """
-    Compare active snapshot against full history.
-    Returns a list of MedChange objects for stopped, changed, and new medications.
-    """
-    changes: list[MedChange] = []
+class DiffResponse(BaseModel):
+    """Returned on GET /diff — always returned; panel always shown on close."""
+    patient_id: str
+    encounter_id: str
+    changes_detected: bool        # True = changes found; False = no changes, list confirmed
+    changes: list[MedChange]
+    patient_note: str             # patient-facing: "Medication changes made today"
+    attestation_note: str         # clinician-facing: full reconciliation note for signing
 
-    # Build lookup by medication name from the full history
-    history: dict[str, list[dict]] = {}
-    for med in all_meds:
-        name = _med_name(med)
-        history.setdefault(name, []).append(med)
 
-    active_names = {_med_name(m) for m in active}
+class SubmitRequest(BaseModel):
+    encounter_id: str
+    attestation_note: str         # clinician may have edited this before confirming
+    patient_note: str             # patient-facing note text
 
-    # Detect newly added (only one entry in history = never prescribed before)
-    for med in active:
-        name = _med_name(med)
-        if len(history.get(name, [])) == 1:
-            changes.append(MedChange(
-                type="added",
-                medication=name,
-                detail=f"New: {_dosage_summary(med)}",
-            ))
 
-    # Detect stopped (in history but not in active)
-    for name, entries in history.items():
-        if name not in active_names:
-            stopped = next(
-                (e for e in entries if e.get("status") in ("stopped", "cancelled", "on-hold")),
-                entries[0],
-            )
-            changes.append(MedChange(
-                type="stopped",
-                medication=name,
-                detail=f"Status: {stopped.get('status', 'unknown')}",
-            ))
-
-    # Detect dose/frequency changes (multiple entries for same med, all active)
-    for med in active:
-        name = _med_name(med)
-        entries = history.get(name, [])
-        if len(entries) >= 2:
-            current_dose = _dosage_summary(entries[0])
-            previous_dose = _dosage_summary(entries[1])
-            if current_dose != previous_dose and previous_dose:
-                changes.append(MedChange(
-                    type="changed",
-                    medication=name,
-                    detail=f"{previous_dose} → {current_dose}",
-                ))
-
-    return changes
+class SubmitResponse(BaseModel):
+    status: str
+    document_id: Optional[str]
+    encounter_note_written: bool
+    amc_checked: bool
