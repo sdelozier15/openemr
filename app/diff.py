@@ -1,130 +1,107 @@
 """
-Medication Reconciliation Microservice
-Connects to OpenEMR FHIR R4 API and detects medication changes
-at the point a clinician opens the medication editor.
+Compute medication changes by diffing two FHIR MedicationRequest snapshots:
+
+  baseline     — captured when clinician opens the medication list (GET 1)
+  post_close   — captured when clinician closes the medication list (GET 2)
+
+Detects:
+  added   — in post_close as active, not in baseline at all
+  stopped — in baseline as active, now stopped/cancelled/on-hold in post_close
+  changed — same med in both, but dose or frequency differs
 """
 
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import os
-from typing import Optional
-
-from app.fhir import fetch_active_meds, fetch_all_meds
-from app.diff import compute_diff
-from app.models import ReconciliationResult, MedChange
-from app.note import build_attestation_note
-
-app = FastAPI(
-    title="Medication Reconciliation Service",
-    description="Event-triggered med reconciliation using OpenEMR FHIR R4",
-    version="0.1.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-OPENEMR_BASE = os.getenv("OPENEMR_FHIR_BASE", "https://localhost:9300/apis/default/fhir")
+from app.models import MedChange
 
 
-async def get_token(authorization: str = Header(...)) -> str:
-    """Extract Bearer token from Authorization header."""
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    return authorization.removeprefix("Bearer ")
+def _med_name(resource: dict) -> str:
+    """Extract human-readable name from a FHIR MedicationRequest resource."""
+    med = resource.get("medicationCodeableConcept", {})
+    codings = med.get("coding", [])
+    if codings:
+        return codings[0].get("display", "Unknown")
+    return med.get("text", "Unknown")
 
 
-@app.get("/reconcile/{patient_id}", response_model=ReconciliationResult)
-async def reconcile(patient_id: str, token: str = Depends(get_token)):
+def _dosage_summary(resource: dict) -> str:
+    """Flatten dosageInstruction into a short comparable string."""
+    instructions = resource.get("dosageInstruction", [])
+    if not instructions:
+        return ""
+    parts = []
+    for d in instructions:
+        dose = d.get("doseAndRate", [{}])[0]
+        qty = dose.get("doseQuantity", {})
+        value = qty.get("value", "")
+        unit = qty.get("unit", "")
+        timing = d.get("timing", {}).get("code", {}).get("text", "")
+        parts.append(f"{value} {unit} {timing}".strip())
+    return "; ".join(parts)
+
+
+def compute_diff(
+    baseline: list[dict],
+    post_close: list[dict],
+) -> list[MedChange]:
     """
-    Called when clinician clicks 'Edit medications'.
-    Returns a diff of medication changes and a pre-filled attestation note.
-    Only returns changes_detected=True if there is something to reconcile.
+    Diff baseline (on-open snapshot) against post_close (on-close snapshot).
+
+    baseline and post_close are both lists of raw FHIR MedicationRequest
+    resources. The frontend captures baseline on open and passes it back
+    to /diff on close — the microservice is stateless between the two events.
+
+    Returns a list of MedChange objects. Empty list = no changes this session.
     """
-    async with httpx.AsyncClient(verify=False) as client:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/fhir+json",
-        }
+    changes: list[MedChange] = []
 
-        active = await fetch_active_meds(client, OPENEMR_BASE, patient_id, headers)
-        all_meds = await fetch_all_meds(client, OPENEMR_BASE, patient_id, headers)
-
-    changes = compute_diff(active, all_meds)
-
-    if not changes:
-        return ReconciliationResult(
-            patient_id=patient_id,
-            changes_detected=False,
-            changes=[],
-            attestation_note=None,
-        )
-
-    note = build_attestation_note(patient_id, changes)
-
-    return ReconciliationResult(
-        patient_id=patient_id,
-        changes_detected=True,
-        changes=changes,
-        attestation_note=note,
-    )
-
-
-@app.post("/reconcile/{patient_id}/submit")
-async def submit_note(
-    patient_id: str,
-    note_text: str,
-    token: str = Depends(get_token),
-):
-    """
-    POSTs the confirmed attestation note back to OpenEMR as a DocumentReference.
-    Only called after explicit clinician confirmation.
-    """
-    import base64
-
-    doc_ref = {
-        "resourceType": "DocumentReference",
-        "status": "current",
-        "type": {
-            "coding": [{
-                "system": "http://loinc.org",
-                "code": "56445-0",
-                "display": "Medication summary Document",
-            }]
-        },
-        "subject": {"reference": f"Patient/{patient_id}"},
-        "content": [{
-            "attachment": {
-                "contentType": "text/plain",
-                "data": base64.b64encode(note_text.encode()).decode(),
-            }
-        }],
+    # Index baseline by name
+    baseline_by_name: dict[str, dict] = {
+        _med_name(m): m for m in baseline
     }
 
-    async with httpx.AsyncClient(verify=False) as client:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/fhir+json",
-        }
-        resp = await client.post(
-            f"{OPENEMR_BASE}/DocumentReference",
-            json=doc_ref,
-            headers=headers,
-        )
-        if resp.status_code not in (200, 201):
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"OpenEMR rejected the note: {resp.text}",
-            )
+    # Index post_close by name
+    post_close_by_name: dict[str, dict] = {
+        _med_name(m): m for m in post_close
+    }
 
-    return {"status": "written", "document_id": resp.json().get("id")}
+    baseline_names = set(baseline_by_name.keys())
+    post_close_names = set(post_close_by_name.keys())
 
+    # Added — active in post_close, not present in baseline at all
+    for name in post_close_names - baseline_names:
+        med = post_close_by_name[name]
+        if med.get("status") == "active":
+            changes.append(MedChange(
+                type="added",
+                medication=name,
+                detail=f"New: {_dosage_summary(med)}",
+            ))
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+    # Stopped — was in baseline, now stopped/cancelled/on-hold in post_close
+    for name in baseline_names:
+        post = post_close_by_name.get(name)
+        if post is None:
+            # Disappeared entirely — treat as stopped
+            changes.append(MedChange(
+                type="stopped",
+                medication=name,
+                detail="Removed from medication list",
+            ))
+        elif post.get("status") in ("stopped", "cancelled", "on-hold"):
+            changes.append(MedChange(
+                type="stopped",
+                medication=name,
+                detail=f"Status: {post.get('status')}",
+            ))
+
+    # Changed — present in both, dose or frequency differs
+    for name in baseline_names & post_close_names:
+        before = _dosage_summary(baseline_by_name[name])
+        after = _dosage_summary(post_close_by_name[name])
+        if before and after and before != after:
+            changes.append(MedChange(
+                type="changed",
+                medication=name,
+                detail=f"{before} → {after}",
+            ))
+
+    return changes
