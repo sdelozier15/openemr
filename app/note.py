@@ -1,14 +1,14 @@
 """
-Build two notes from detected changes:
+Build a single reconciliation note that serves two purposes:
 
-1. attestation_note  — clinician-facing, full reconciliation note for signing.
-                       Goes to Visit Summary via native encounter note API.
+1. Clinical record — structured attestation satisfying MIPS / TJC audit
+   requirements: patient identity, encounter, changes with clinical detail,
+   clinician attestation, and signature line.
 
-2. patient_note      — patient-facing, plain language summary.
-                       Goes to "Link/Add Issues to This Visit" as a document
-                       titled "Medication changes made today".
-                       Always generated — even when no changes found — so the
-                       clinician always confirms before the AMC box is checked.
+2. Patient-readable summary — plain-language "For Your Records" section
+   appended at the bottom, suitable for the patient to keep.
+
+One note. One POST to soap_note. No separate DocumentReference needed.
 """
 
 from datetime import date
@@ -27,19 +27,22 @@ def build_attestation_note(
     changes: list[MedChange],
 ) -> str:
     """
-    Full reconciliation note for the clinician to review, edit, and sign.
-    Lands in the Visit Summary (native encounter note endpoint).
+    Single note combining clinical attestation (audit-ready) and patient
+    plain-language summary (for the patient portal / visit summary).
+
+    Posted via POST /api/patient/{pid}/encounter/{eid}/soap_note
+    with authorized=1 so it lands in the Visit Summary and is signed.
     """
     today = date.today().strftime("%B %d, %Y")
 
     lines = [
-        "MEDICATION RECONCILIATION NOTE",
-        f"Date: {today}",
+        f"MEDICATION RECONCILIATION — {today}",
         f"Patient ID: {patient_id}",
         f"Clinician: {clinician_name}",
         "",
     ]
 
+    # ── Clinical section (audit-facing) ──────────────────────────────────────
     if changes:
         lines.append("CHANGES THIS ENCOUNTER:")
         for i, c in enumerate(changes, 1):
@@ -55,69 +58,44 @@ def build_attestation_note(
         "",
         "ATTESTATION:",
         (
-            "Medication list reviewed with patient. All changes discussed. "
-            "Patient verbalized understanding. No unresolved discrepancies."
+            "Medication list reviewed with patient. All changes discussed and understood. "
+            "No unresolved discrepancies. Patient verbalized understanding."
         ) if changes else (
             "Medication list reviewed with patient. No changes identified. "
             "List confirmed current and accurate."
         ),
         "",
         "[Clinician signature] _______________",
-    ]
-
-    return "\n".join(lines)
-
-
-def build_patient_note(changes: list[MedChange]) -> str:
-    """
-    Plain-language patient-facing summary.
-    Posted as a DocumentReference titled "Medication changes made today"
-    linked to the visit — visible in the patient portal and Visit Summary
-    under Link/Add Issues to This Visit.
-
-    Always generated regardless of whether changes were found, so the
-    clinician always has something to confirm before the AMC box is checked.
-    """
-    today = date.today().strftime("%B %d, %Y")
-
-    lines = [
-        f"MEDICATION CHANGES MADE TODAY — {today}",
         "",
     ]
+
+    # ── Patient-readable section ──────────────────────────────────────────────
+    lines.append("FOR YOUR RECORDS:")
 
     if changes:
         added   = [c for c in changes if c.type == "added"]
         stopped = [c for c in changes if c.type == "stopped"]
         changed = [c for c in changes if c.type == "changed"]
 
-        if added:
-            lines.append("New medications started:")
-            for c in added:
-                lines.append(f"  • {c.medication} — {c.detail}")
-            lines.append("")
-
         if stopped:
-            lines.append("Medications stopped:")
+            lines.append("  Medications stopped:")
             for c in stopped:
-                lines.append(f"  • {c.medication}")
-            lines.append("")
-
+                lines.append(f"    • {c.medication}")
         if changed:
-            lines.append("Medications with dose or frequency changes:")
+            lines.append("  Medications adjusted:")
             for c in changed:
-                lines.append(f"  • {c.medication} — {c.detail}")
-            lines.append("")
+                lines.append(f"    • {c.medication} — {c.detail}")
+        if added:
+            lines.append("  New medications started:")
+            for c in added:
+                lines.append(f"    • {c.medication} — {c.detail}")
 
-        lines += [
-            "If you have questions about any of these changes, please contact your care team.",
-        ]
+        lines.append("  Questions? Contact your care team.")
     else:
         lines += [
-            "No changes were made to your medications at today's visit.",
-            "",
-            "Your current medication list was reviewed and confirmed accurate.",
-            "If you have any questions, please contact your care team.",
+            "  No changes were made to your medications at today's visit.",
+            "  Your medication list was reviewed and confirmed accurate.",
+            "  Questions? Contact your care team.",
         ]
 
     return "\n".join(lines)
-
