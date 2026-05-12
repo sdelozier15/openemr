@@ -11,30 +11,28 @@ class MedChange(BaseModel):
 
 
 class BaselineResponse(BaseModel):
-    """Returned on GET /baseline — the before-snapshot captured when med list opens."""
+    """Returned on GET /baseline — before-snapshot captured when med list opens."""
     patient_id: str
     encounter_id: str
-    snapshot: list[dict]          # raw FHIR MedicationRequest resources, held by frontend
+    snapshot: list[dict]
 
 
 class DiffResponse(BaseModel):
-    """Returned on GET /diff — always returned; panel always shown on close."""
+    """Returned on POST /diff — always returned; panel always shown on close."""
     patient_id: str
     encounter_id: str
-    changes_detected: bool        # True = changes found; False = no changes, list confirmed
+    changes_detected: bool
     changes: list[MedChange]
-    patient_note: str             # patient-facing: "Medication changes made today"
-    attestation_note: str         # clinician-facing: full reconciliation note for signing
+    note: str                  # single combined note — clinical + patient-readable
 
 
 class SubmitRequest(BaseModel):
     encounter_id: str
-    attestation_note: str         # clinician may have edited this before confirming
-    patient_note: str             # patient-facing note text
+    note: str                  # clinician may have edited before confirming
+    patient_id: str            # needed for AMC DB insert
 
 
 class SubmitResponse(BaseModel):
     status: str
-    document_id: Optional[str]
-    encounter_note_written: bool
+    soap_note_written: bool
     amc_checked: bool
