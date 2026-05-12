@@ -1,66 +1,93 @@
 """
-AMC checkbox helper.
+AMC checkbox — Option 1: direct database write.
 
-Patches the "Medication Reconciliation Performed?" checkbox on an OpenEMR
-encounter via the native REST API (not FHIR — this field lives in
-form_encounter, not as a FHIR resource).
+The "Medication Reconciliation Performed?" checkbox is stored in the
+amc_misc_data table, not in form_encounter and not exposed via any
+OpenEMR REST or FHIR endpoint. The internal PHP functions amcAdd /
+amcAddForce write to this table directly.
 
-HOW TO CONFIRM THE EXACT ENDPOINT FOR YOUR INSTANCE:
-  1. Open an encounter in OpenEMR (demo.openemr.io works)
-  2. Open DevTools → Network tab → clear it
-  3. Manually check "Medication Reconciliation Performed?"
-  4. Read the request that fires — that's the exact URL and payload
-  5. Update NATIVE_BASE and the payload dict below to match
+Source confirmed at:
+  openemr/library/amc.php     — amcAddForce inserts into amc_misc_data
+  openemr/sql/database.sql    — 'med_reconc_amc' is the registered rule ID
+  openemr/interface/patient_file/encounter/forms.php
+                               — amcCollect("med_reconc_amc", ...) reads it
 
-The placeholder endpoint pattern below follows the OpenEMR native REST
-convention. The field name inside the payload must be verified against
-your instance before deploying — it is NOT standardised across versions.
+OPTION 1 replicates exactly what amcAddForce does: a direct INSERT into
+amc_misc_data. This is the same operation the OpenEMR UI performs internally.
+
+To use:
+  1. Add DB credentials to your .env (see .env.example)
+  2. pip install aiomysql
+  3. Call insert_amc_checkbox(pid, encounter_id) from the submit endpoint
+
+OPTION 3 (preferred if available on your instance):
+  Open the encounter in the demo, check the box manually, and watch the
+  network tab in DevTools. If OpenEMR fires an AJAX call, replicate that
+  instead — it avoids direct DB access. Update this file if you find it.
 """
 
 import os
-import httpx
+import logging
 
-NATIVE_BASE = os.getenv(
-    "OPENEMR_NATIVE_BASE",
-    "https://localhost:9300/apis/default/api",
-)
+logger = logging.getLogger(__name__)
+
+DB_HOST = os.getenv("OPENEMR_DB_HOST", "localhost")
+DB_PORT = int(os.getenv("OPENEMR_DB_PORT", "3306"))
+DB_NAME = os.getenv("OPENEMR_DB_NAME", "openemr")
+DB_USER = os.getenv("OPENEMR_DB_USER", "openemr")
+DB_PASS = os.getenv("OPENEMR_DB_PASS", "openemr")
 
 
-async def patch_amc_checkbox(
-    client: httpx.AsyncClient,
-    encounter_id: str,
-    token: str,
-) -> bool:
+async def insert_amc_checkbox(pid: str, encounter_id: str) -> bool:
     """
-    Check "Medication Reconciliation Performed?" on the encounter record.
+    Insert a completed amc_misc_data row for med_reconc_amc.
 
-    Always called on submit (Option B) — the clinician confirmed they
-    reviewed the list, which is the reconciliation act regardless of
-    whether any changes were found.
+    Equivalent to OpenEMR's internal call:
+        amcAddForce("med_reconc_amc", true, $pid, "form_encounter", $encounter_id)
 
-    Returns True if successful, False if the call failed (non-fatal —
-    the notes are already written by the time this runs).
+    Which inserts:
+        INSERT INTO amc_misc_data
+          (amc_id, pid, map_category, map_id, date_created, date_completed)
+        VALUES
+          ('med_reconc_amc', {pid}, 'form_encounter', {encounter_id}, NOW(), NOW())
+
+    Returns True on success, False on failure (non-fatal — note already written).
     """
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
-    # Field name TBD — verify via DevTools. Common candidates:
-    #   med_reconciliation, reconciliation_performed, or a numeric form field ID.
-    payload = {"med_reconciliation": 1}
-
-    resp = await client.patch(
-        f"{NATIVE_BASE}/encounter/{encounter_id}",
-        json=payload,
-        headers=headers,
-    )
-
-    if resp.status_code not in (200, 201):
-        print(
-            f"[warn] AMC checkbox PATCH returned {resp.status_code}: {resp.text}\n"
-            "Verify the endpoint and field name via DevTools — see amc.py comments."
+    try:
+        import aiomysql
+    except ImportError:
+        logger.warning(
+            "aiomysql not installed — AMC checkbox skipped. "
+            "Run: pip install aiomysql"
         )
         return False
 
-    return True
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            db=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+        )
+        async with conn.cursor() as cur:
+            # Use INSERT IGNORE so re-running submit doesn't create duplicates
+            await cur.execute(
+                """
+                INSERT IGNORE INTO amc_misc_data
+                  (amc_id, pid, map_category, map_id, date_created, date_completed)
+                VALUES
+                  (%s, %s, %s, %s, NOW(), NOW())
+                """,
+                ("med_reconc_amc", pid, "form_encounter", encounter_id),
+            )
+            await conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        logger.warning(
+            f"AMC checkbox insert failed: {e}. "
+            "Check OPENEMR_DB_* env vars. Note was still written to chart."
+        )
+        return False
